@@ -1,0 +1,869 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1025,7 +1025,7 @@
+   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+   with_gallium_panfrost, with_panfrost_vk,
+   with_gallium_rusticl,
+-  with_nouveau_vk, with_imagination_vk,
++  (with_nouveau_vk and host_machine.system() != 'darwin'), with_imagination_vk,
+   with_kosmickrisp_vk,
+ ].contains(true)
+ 
+@@ -1152,7 +1152,7 @@
+ # Find a python executable that meets our version requirement.
+ # - On Windows, a venv has no versioned aliased to 'python'.
+ # - On RHEL 9, python3 is 3.9, so we must use python3.12.
+-python_version_req = '>= 3.10'
++python_version_req = '>= 3.9'
+ python_exec_list = ['python3.16', 'python3.15', 'python3.14', 'python3.13',
+                     'python3.12', 'python3.11', 'python3.10', 'python3', 'python']
+ 
+@@ -2153,7 +2153,7 @@
+   pre_args += '-DUSE_LIBELF'
+ elif with_gallium_radeonsi and with_gfx_compute
+   error('Gallium driver radeonsi requires libelf')
+-elif with_nouveau_vk
++elif with_nouveau_vk and host_machine.system() != 'darwin'
+   error('NVK requires libelf')
+ endif
+ 
+
+--- a/src/nouveau/meson.build
++++ b/src/nouveau/meson.build
+@@ -2,8 +2,10 @@
+ # SPDX-License-Identifier: MIT
+ 
+ subdir('headers')
+-subdir('drm')
+-subdir('winsys')
++if dep_libdrm.found()
++  subdir('drm')
++  subdir('winsys')
++endif
+ if with_nouveau_vk
+   subdir('rust')
+   subdir('nil')
+
+--- a/src/nouveau/compiler/meson.build
++++ b/src/nouveau/compiler/meson.build
+@@ -40,6 +40,14 @@
+   idep_nil_h,
+ ]
+ 
++_nak_bindgen_deps = [
++  dep_libdrm,
++  libnak_deps,
++]
++if dep_libdrm.found()
++  _nak_bindgen_deps += [idep_nouveau_ws]
++endif
++
+ _nak_bindings_rs = rust.bindgen(
+   input : ['nak_bindings.h'],
+   output : 'nak_bindings.rs',
+@@ -65,11 +73,7 @@
+     '--no-prepend-enum-name',
+     '--with-derive-default',
+   ],
+-  dependencies : [
+-    dep_libdrm,
+-    idep_nouveau_ws,
+-    libnak_deps,
+-  ],
++  dependencies : _nak_bindgen_deps,
+ )
+ 
+ _libnak_bindings_rs = static_library(
+
+--- a/src/nouveau/compiler/nak_bindings.h
++++ b/src/nouveau/compiler/nak_bindings.h
+@@ -5,6 +5,7 @@
+ 
+ #include "nak_private.h"
+ 
++#ifndef __APPLE__
+ #include "nouveau_bo.h"
+ #include "nouveau_context.h"
+ #include "nouveau_device.h"
+@@ -18,3 +19,4 @@
+ enum ENUM_PACKED drm_rs_ioctls {
+    DRM_RS_IOCTL(NOUVEAU_EXEC),
+ };
++#endif
+
+--- a/src/nouveau/cubin/meson.build
++++ b/src/nouveau/cubin/meson.build
+@@ -1,10 +1,17 @@
+ # Copyright © 2025 Autumn Ashton
+ # SPDX-License-Identifier: MIT
+ 
+-libnouveau_cubin_files = files(
+-  'nv_cubin.c',
+-  'nv_fatbin.c',
+-)
++if dep_elf.found()
++  libnouveau_cubin_files = files(
++    'nv_cubin.c',
++    'nv_fatbin.c',
++  )
++else
++  libnouveau_cubin_files = files(
++    'nv_cubin_stub.c',
++    'nv_fatbin.c',
++  )
++endif
+ 
+ _libnouveau_cubin = static_library(
+   'nouveau_cubin',
+
+--- a/src/nouveau/mme/meson.build
++++ b/src/nouveau/mme/meson.build
+@@ -108,17 +108,19 @@
+   install : with_tools.contains('nouveau'),
+ )
+ 
+-executable(
+-  'nv_mme_method_dumper',
+-  'nv_mme_method_dumper.c',
+-  include_directories : [inc_include, inc_src],
+-  dependencies : [
+-    dep_libdrm,
+-    idep_mesautil,
+-    idep_nvidia_headers,
+-    idep_nouveau_mme,
+-    idep_nouveau_ws
+-  ],
+-  build_by_default : with_tools.contains('nouveau'),
+-  install : with_tools.contains('nouveau'),
+-)
++if dep_libdrm.found()
++  executable(
++    'nv_mme_method_dumper',
++    'nv_mme_method_dumper.c',
++    include_directories : [inc_include, inc_src],
++    dependencies : [
++      dep_libdrm,
++      idep_mesautil,
++      idep_nvidia_headers,
++      idep_nouveau_mme,
++      idep_nouveau_ws
++    ],
++    build_by_default : with_tools.contains('nouveau'),
++    install : with_tools.contains('nouveau'),
++  )
++endif
+
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -13,7 +13,7 @@
+ dep_paste = dependency(
+   'paste',
+   version: '>= 1.0.14',
+-  fallback: ['paste', 'dep_paste'],
++  fallback: ['paste-1-rs', 'dep_paste'],
+   required: true,
+ )
+ 
+@@ -92,20 +92,54 @@
+   'nvk_wsi.h',
+   'layers/nvk_app_workarounds.c',
+   'layers/nvk_app_workarounds.h',
+-  'nvkmd/nouveau/nvkmd_nouveau.h',
+-  'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_dev.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_mem.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_va.c',
+   'nvkmd/nvkmd.c',
+   'nvkmd/nvkmd.h',
+ )
+ 
+-nvkcl_files = files(
+-  'cl/nvk_query.cl',
+-  'cl/nvk_copy_indirect.cl',
+-)
++if host_machine.system() == 'darwin'
++  nvk_files += files(
++    'nvkmd/macos/nvkmd_macos.h',
++    'nvkmd/macos/nvkmd_macos.c',
++    'nvkcl_macos.c',
++  )
++  nvkcl = []
++else
++  nvk_files += files(
++    'nvkmd/nouveau/nvkmd_nouveau.h',
++    'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
++    'nvkmd/nouveau/nvkmd_nouveau_dev.c',
++    'nvkmd/nouveau/nvkmd_nouveau_mem.c',
++    'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
++    'nvkmd/nouveau/nvkmd_nouveau_va.c',
++  )
++
++  nvkcl_files = files(
++    'cl/nvk_query.cl',
++    'cl/nvk_copy_indirect.cl',
++  )
++
++  nvkcl_spv = custom_target(
++    input : [nvkcl_files, libnvidia_headers],
++    output : 'nvkcl.spv',
++    command : [
++      prog_mesa_clc, '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', nvkcl_files, '--',
++      '-I' + join_paths(meson.project_source_root(), 'src/compiler/libcl'),
++      '-I' + join_paths(meson.current_source_dir(), '.'),
++      '-I' + join_paths(meson.project_source_root(), 'src'),
++      '-I' + join_paths(meson.project_source_root(), 'src/nouveau/headers'),
++      '-I' + join_paths(meson.project_source_root(), 'src/nouveau/headers/nvidia/classes'),
++      '-I' + join_paths(meson.project_build_root(), 'src/nouveau/headers'),
++      cl_args,
++      ],
++    depfile : 'nvkcl.spv.d',
++  )
++
++  nvkcl = custom_target(
++    input : nvkcl_spv,
++    output : ['nvkcl.cpp', 'nvkcl.h'],
++    command : [prog_vtn_bindgen2, '@INPUT@', '@OUTPUT@'],
++  )
++endif
+ 
+ nvk_entrypoints = custom_target(
+   'nvk_entrypoints',
+@@ -117,28 +151,6 @@
+     '--beta', with_vulkan_beta.to_string(),
+   ],
+   depend_files : vk_entrypoints_gen_depend_files,
+-)
+-
+-nvkcl_spv = custom_target(
+-  input : [nvkcl_files, libnvidia_headers],
+-  output : 'nvkcl.spv',
+-  command : [
+-    prog_mesa_clc, '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', nvkcl_files, '--',
+-    '-I' + join_paths(meson.project_source_root(), 'src/compiler/libcl'),
+-    '-I' + join_paths(meson.current_source_dir(), '.'),
+-    '-I' + join_paths(meson.project_source_root(), 'src'),
+-    '-I' + join_paths(meson.project_source_root(), 'src/nouveau/headers'),
+-    '-I' + join_paths(meson.project_source_root(), 'src/nouveau/headers/nvidia/classes'),
+-    '-I' + join_paths(meson.project_build_root(), 'src/nouveau/headers'),
+-    cl_args,
+-    ],
+-  depfile : 'nvkcl.spv.d',
+-)
+-
+-nvkcl = custom_target(
+-  input : nvkcl_spv,
+-  output : ['nvkcl.cpp', 'nvkcl.h'],
+-  command : [prog_vtn_bindgen2, '@INPUT@', '@OUTPUT@'],
+ )
+ 
+ nvk_drirc = custom_target(
+@@ -164,7 +176,6 @@
+   idep_mesautil,
+   idep_nouveau_cubin,
+   idep_nouveau_mme,
+-  idep_nouveau_ws,
+   idep_nvidia_headers,
+   idep_vulkan_runtime,
+   idep_vulkan_runtime_headers,
+@@ -173,6 +184,9 @@
+   idep_vulkan_wsi,
+   idep_vulkan_wsi_headers,
+ ]
++if dep_libdrm.found()
++  nvk_deps += [idep_nouveau_ws]
++endif
+ 
+ nvk_include_directories = [
+   fs.relative_to(meson.project_build_root(), meson.current_source_dir()),
+@@ -294,10 +308,24 @@
+   gnu_symbol_visibility : 'hidden',
+ )
+ 
++nvk_link_args = [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections]
++if host_machine.system() == 'darwin'
++  nvk_link_args += [
++    '-Wl,-undefined,dynamic_lookup',
++    '/Users/maple/projects/temp/mx250-macos/build/libnvkm_gp108.a',
++    '-Wl,-framework,IOKit',
++    '-Wl,-framework,CoreFoundation',
++    '-Wl,-framework,Metal',
++    '-Wl,-framework,QuartzCore',
++    '-Wl,-framework,Foundation',
++    '-Wl,-framework,CoreGraphics',
++  ]
++endif
++
+ libvulkan_nouveau = shared_library(
+   'vulkan_nouveau',
+   link_whole : [libnvk],
+-  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],
++  link_args: nvk_link_args,
+   gnu_symbol_visibility : 'hidden',
+   install : true,
+ )
+
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -14,7 +14,9 @@
+ #include "nvkmd/nvkmd.h"
+ 
+ #include "vk_common_entrypoints.h"
++#ifndef __APPLE__
+ #include "vk_drm_syncobj.h"
++#endif
+ #include "vk_pipeline_cache.h"
+ #include "vk_debug_utils.h"
+ #include "util/u_printf.h"
+@@ -257,11 +259,15 @@
+       if (result != VK_SUCCESS)
+          goto fail_init;
+ 
++#ifndef __APPLE__
+       vk_device_set_drm_fd(&dev->vk, nvkmd_dev_get_drm_fd(dev->nvkmd));
++#endif
+       dev->vk.command_buffer_ops = &nvk_cmd_buffer_ops;
+ 
+       dev->vk.get_timestamp = nvk_device_get_timestamp;
++#ifndef __APPLE__
+       dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
++#endif
+ 
+       result = nvk_upload_queue_init(dev, &dev->upload);
+       if (result != VK_SUCCESS)
+
+--- a/src/nouveau/vulkan/nvk_instance.c
++++ b/src/nouveau/vulkan/nvk_instance.c
+@@ -53,6 +53,9 @@
+    .EXT_direct_mode_display = true,
+    .EXT_display_surface_counter = true,
+    .EXT_acquire_drm_display = true,
++#endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++   .EXT_metal_surface = true,
+ #endif
+ #ifndef VK_USE_PLATFORM_WIN32_KHR
+    .EXT_headless_surface = true,
+@@ -161,8 +164,13 @@
+    nvk_init_experimental_flags(instance);
+    nvk_init_dri_options(instance);
+ 
++#ifdef __APPLE__
++   instance->vk.physical_devices.enumerate =
++      nvk_enumerate_macos_physical_devices;
++#else
+    instance->vk.physical_devices.try_create_for_drm =
+       nvk_create_drm_physical_device;
++#endif
+    instance->vk.physical_devices.destroy = nvk_physical_device_destroy;
+ 
+    const struct build_id_note *note =
+@@ -174,6 +182,16 @@
+    }
+ 
+    unsigned build_id_len = build_id_length(note);
++#ifdef __APPLE__
++   if (build_id_len < VK_UUID_SIZE) {
++      result = vk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
++                         "Mach-O LC_UUID too short");
++      goto fail_init;
++   }
++   memset(instance->driver_build_sha, 0, sizeof(instance->driver_build_sha));
++   memcpy(instance->driver_build_sha, build_id_data(note),
++          MIN2(build_id_len, sizeof(instance->driver_build_sha)));
++#else
+    if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
+       result = vk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
+                         "build-id too short.  It needs to be a SHA");
+@@ -182,6 +200,7 @@
+ 
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
+    copy_build_id_to_sha1(instance->driver_build_sha, note);
++#endif
+ 
+    *pInstance = nvk_instance_to_handle(instance);
+    return VK_SUCCESS;
+
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -16,7 +16,11 @@
+ #include "nvk_shader.h"
+ #include "nvk_wsi.h"
+ #include "nvkmd/nvkmd.h"
++#ifdef __APPLE__
++#include "nvkmd/macos/nvkmd_macos.h"
++#else
+ #include "nvkmd/nouveau/nvkmd_nouveau.h"
++#endif
+ #include "git_sha1.h"
+ #include "util/detect_os.h"
+ #include "util/disk_cache.h"
+@@ -26,12 +30,18 @@
+ 
+ #include "vk_android.h"
+ #include "vk_device.h"
++#ifndef __APPLE__
+ #include "vk_drm_syncobj.h"
++#endif
+ #include "vk_physical_device.h"
+ #include "vk_shader_module.h"
+ #include "vulkan/wsi/wsi_common.h"
+ 
++#ifdef __APPLE__
++#include <sys/types.h>
++#else
+ #include <sys/sysmacros.h>
++#endif
+ 
+ #include "nv_push.h"
+ #include "cl90c0.h"
+@@ -1528,19 +1538,60 @@
+    return pdev->info.vram_size_B - used;
+ }
+ 
++static VkResult
++nvk_create_physical_device_from_nvkmd(struct nvk_instance *instance,
++                                      struct nvkmd_pdev *nvkmd,
++                                      struct vk_physical_device **pdev_out);
++
+ VkResult
+ nvk_create_drm_physical_device(struct vk_instance *_instance,
+                                struct _drmDevice *drm_device,
+                                struct vk_physical_device **pdev_out)
+ {
+    struct nvk_instance *instance = (struct nvk_instance *)_instance;
+-   VkResult result;
+-
+    struct nvkmd_pdev *nvkmd;
+-   result = nvkmd_try_create_pdev_for_drm(drm_device, &instance->vk.base,
+-                                          instance->debug_flags, &nvkmd);
++   VkResult result = nvkmd_try_create_pdev_for_drm(drm_device,
++                                                   &instance->vk.base,
++                                                   instance->debug_flags,
++                                                   &nvkmd);
+    if (result != VK_SUCCESS)
+       return result;
++
++   return nvk_create_physical_device_from_nvkmd(instance, nvkmd, pdev_out);
++}
++
++#ifdef __APPLE__
++VkResult
++nvk_enumerate_macos_physical_devices(struct vk_instance *_instance)
++{
++   struct nvk_instance *instance = (struct nvk_instance *)_instance;
++   struct nvkmd_pdev *nvkmd = NULL;
++   VkResult result = nvkmd_macos_try_create_pdev(&instance->vk.base,
++                                                 instance->debug_flags,
++                                                 &nvkmd);
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct vk_physical_device *vk_pdev = NULL;
++   result = nvk_create_physical_device_from_nvkmd(instance, nvkmd, &vk_pdev);
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;
++   if (result != VK_SUCCESS)
++      return result;
++
++   list_addtail(&vk_pdev->link, &instance->vk.physical_devices.list);
++   return VK_SUCCESS;
++}
++#endif
++
++static VkResult
++nvk_create_physical_device_from_nvkmd(struct nvk_instance *instance,
++                                      struct nvkmd_pdev *nvkmd,
++                                      struct vk_physical_device **pdev_out)
++{
++   VkResult result;
+ 
+    /* We don't support anything pre-Kepler */
+    if (nvkmd->dev_info.cls_eng3d < KEPLER_A) {
+
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -97,6 +97,10 @@
+                                         struct _drmDevice *drm_device,
+                                         struct vk_physical_device **pdev_out);
+ 
++#ifdef __APPLE__
++VkResult nvk_enumerate_macos_physical_devices(struct vk_instance *vk_instance);
++#endif
++
+ void nvk_physical_device_destroy(struct vk_physical_device *vk_device);
+ 
+ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
+@@ -105,7 +109,9 @@
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
+     defined(VK_USE_PLATFORM_XCB_KHR) || \
+     defined(VK_USE_PLATFORM_XLIB_KHR) || \
+-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
++    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
++    defined(VK_USE_PLATFORM_METAL_EXT) || \
++    defined(VK_USE_PLATFORM_MACOS_MVK)
+ #define NVK_USE_WSI_PLATFORM
+ #endif
+ 
+
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -23,7 +23,14 @@
+    if (pdev->vk.instance->enabled_extensions.KHR_display)
+       display_fd = nvkmd_pdev_get_drm_primary_fd(pdev->nvkmd);
+    struct wsi_device_options wsi_options = {
++#ifdef __APPLE__
++      /* Enables PRIME offload: MX250 BlockLinear -> PitchLinear PCIe DMA into
++       * 40-bit pinned host memory + zero-copy Intel MTLBuffer CAMetalLayer blit!
++       */
++      .sw_device = true
++#else
+       .sw_device = false
++#endif
+    };
+    result = wsi_device_init(&pdev->wsi_device,
+                             nvk_physical_device_to_handle(pdev),
+
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -4,7 +4,9 @@
+  */
+ 
+ #include "nvkmd.h"
++#ifndef __APPLE__
+ #include "nouveau/nvkmd_nouveau.h"
++#endif
+ #include "nv_push.h"
+ #include "util/cache_ops.h"
+ #include "util/u_math.h"
+@@ -88,8 +90,13 @@
+                               enum nvk_debug debug_flags,
+                               struct nvkmd_pdev **pdev_out)
+ {
++#ifdef __APPLE__
++   (void)drm_device; (void)log_obj; (void)debug_flags; (void)pdev_out;
++   return VK_ERROR_INCOMPATIBLE_DRIVER;
++#else
+    return nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
+                                         debug_flags, pdev_out);
++#endif
+ }
+ 
+ VkResult MUST_CHECK
+
+--- a/src/vulkan/runtime/vk_image.c
++++ b/src/vulkan/runtime/vk_image.c
+@@ -23,7 +23,7 @@
+ 
+ #include "vk_image.h"
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ #include <drm-uapi/drm_fourcc.h>
+ #endif
+ 
+@@ -111,7 +111,7 @@
+       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
+ #endif
+ 
+@@ -196,7 +196,7 @@
+    vk_object_free(device, alloc, image);
+ }
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
+                                                  VkImage _image,
+
+--- a/src/vulkan/runtime/vk_image.h
++++ b/src/vulkan/runtime/vk_image.h
+@@ -80,7 +80,7 @@
+    /* wsi_image_create_info::scanout */
+    bool wsi_legacy_scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    /* VK_EXT_drm_format_modifier
+     *
+     * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's
+
+--- a/src/vulkan/util/vk_cmd_queue_gen.py
++++ b/src/vulkan/util/vk_cmd_queue_gen.py
+@@ -588,13 +588,13 @@
+     info.has_explicit_copy = param.type in EXPLICIT_PARAM_COPIES
+     info.needs_member_copy = info.has_explicit_copy
+     for member in types[param.type].members:
+-        match categorize_param(command, types, param.type, member):
+-            case ParamCategory.PNEXT | ParamCategory.STRUCT | ParamCategory.STRING | ParamCategory.INLINE_STRUCT:
+-                info.needs_member_copy = True
+-            case ParamCategory.PIPELINE_LAYOUT:
+-                info.additional_code.append("enqueue_pipeline_layout(queue, %s->%s);" % (src, member.name))
+-            case ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE:
+-                info.additional_code.append("enqueue_descriptor_template(queue, %s->%s);" % (src, member.name))
++        cat = categorize_param(command, types, param.type, member)
++        if cat in (ParamCategory.PNEXT, ParamCategory.STRUCT, ParamCategory.STRING, ParamCategory.INLINE_STRUCT):
++            info.needs_member_copy = True
++        elif cat == ParamCategory.PIPELINE_LAYOUT:
++            info.additional_code.append("enqueue_pipeline_layout(queue, %s->%s);" % (src, member.name))
++        elif cat == ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE:
++            info.additional_code.append("enqueue_descriptor_template(queue, %s->%s);" % (src, member.name))
+     return info
+ 
+ def categorize_param(command, types, parent_type, param):
+@@ -668,112 +668,109 @@
+     dst = dst_parent_access + (to_field_name(param.name) if dst_snake_case else param.name)
+ 
+     param_category = categorize_param(command, types, None, param)
+-    match param_category:
+-        case ParamCategory.ASSIGNABLE:
+-            builder.add("%s = %s;" % (dst, src))
+-        case ParamCategory.FLAT_ARRAY:
+-            builder.add("memcpy(%s, %s, sizeof(*%s) * %s);" % (dst, src, src, get_array_len(param)))
+-        case ParamCategory.UNSIZED_RAW_POINTER:
+-            builder.add("%s = (%s)%s;" % (dst, remove_suffix(param.decl.replace("const", ""), param.name), src))
+-        case ParamCategory.STRING:
+-            builder.add("%s = linear_strdup(queue->ctx, %s);" % (dst, src))
+-        case ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE_DATA:
+-            builder.add("%s = enqueue_push_descriptor_template_data(queue, %sdescriptorUpdateTemplate, %s);" % (dst, src_parent_access, src))
+-        case ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE:
+-                builder.add("%s = %s;" % (dst, src))
+-                builder.add("enqueue_descriptor_template(queue, %s);" % (src))
+-        case ParamCategory.PIPELINE_LAYOUT:
+-                builder.add("%s = %s;" % (dst, src))
+-                builder.add("enqueue_pipeline_layout(queue, %s);" % (src))
+-        case ParamCategory.STRUCT | ParamCategory.INLINE_STRUCT:
+-            if param_category == ParamCategory.INLINE_STRUCT:
+-                nullable = False
+-                src = "&%s" % (src)
+-                dst = "&%s" % (dst)
+-
+-            if nullable:
+-                builder.add("if (%s) {" % (src))
++    if param_category == ParamCategory.ASSIGNABLE:
++        builder.add("%s = %s;" % (dst, src))
++    elif param_category == ParamCategory.FLAT_ARRAY:
++        builder.add("memcpy(%s, %s, sizeof(*%s) * %s);" % (dst, src, src, get_array_len(param)))
++    elif param_category == ParamCategory.UNSIZED_RAW_POINTER:
++        builder.add("%s = (%s)%s;" % (dst, remove_suffix(param.decl.replace("const", ""), param.name), src))
++    elif param_category == ParamCategory.STRING:
++        builder.add("%s = linear_strdup(queue->ctx, %s);" % (dst, src))
++    elif param_category == ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE_DATA:
++        builder.add("%s = enqueue_push_descriptor_template_data(queue, %sdescriptorUpdateTemplate, %s);" % (dst, src_parent_access, src))
++    elif param_category == ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE:
++        builder.add("%s = %s;" % (dst, src))
++        builder.add("enqueue_descriptor_template(queue, %s);" % (src))
++    elif param_category == ParamCategory.PIPELINE_LAYOUT:
++        builder.add("%s = %s;" % (dst, src))
++        builder.add("enqueue_pipeline_layout(queue, %s);" % (src))
++    elif param_category in (ParamCategory.STRUCT, ParamCategory.INLINE_STRUCT):
++        if param_category == ParamCategory.INLINE_STRUCT:
++            nullable = False
++            src = "&%s" % (src)
++            dst = "&%s" % (dst)
++
++        if nullable:
++            builder.add("if (%s) {" % (src))
++            builder.level += 1
++
++        if param.type == "void":
++            size = 1
++        else:
++            size = "sizeof(%s)" % param.type
++
++        is_ndarray = param.len and "," in param.len
++        if param.len and param.len != "struct-ptr" and not is_ndarray:
++            size = "%s * ceil(%s%s)" % (size, src_parent_access, param.len)
++
++        if param_category != ParamCategory.INLINE_STRUCT:
++            builder.add("%s = linear_alloc_child(queue->ctx, %s);" % (dst, size))
++            builder.add("if (%s == NULL) return NULL;" % (dst))
++            builder.add("memcpy((void *)%s, %s, %s);" % (dst, src, size))
++
++        if param.type == 'VkDescriptorSetLayout':
++            array_index = builder.get_variable_name("i")
++            builder.add("for (unsigned %s = 0; %s < %s%s; %s++) {" % (array_index, array_index, src_parent_access, param.len, array_index))
++            builder.level += 1
++            builder.add("enqueue_descriptor_layout(queue, %s[%s]);" % (src, array_index))
++            builder.level -= 1
++            builder.add("}")
++
++        if param.type in types:
++            struct_info = get_struct_info(command, param, types, src)
++            for code in struct_info.additional_code:
++                builder.add(code);
++
++            if struct_info.needs_member_copy:
++                tmp_dst_name = builder.get_variable_name("tmp_dst")
++                tmp_src_name = builder.get_variable_name("tmp_src")
++
++                builder.add("%s *%s = (void *)%s;" % (param.type, tmp_dst_name, dst))
++                builder.add("%s *%s = (void *)%s;" % (param.type, tmp_src_name, src))
++
++                struct_array_copy = param.len and param.len != "struct-ptr" and param.type != "void"
++                if struct_array_copy:
++                    array_index = builder.get_variable_name("i")
++                    builder.add("for (uint32_t %s = 0; %s < %s%s; %s++) {" % (array_index, array_index, src_parent_access, param.len, array_index))
++                    builder.level += 1
++                    prev_tmp_dst_name = tmp_dst_name
++                    prev_tmp_src_name = tmp_src_name
++                    tmp_dst_name = builder.get_variable_name("tmp_dst")
++                    tmp_src_name = builder.get_variable_name("tmp_src")
++                    builder.add("%s *%s = %s + %s;" % (param.type, tmp_dst_name, prev_tmp_dst_name, array_index))
++                    builder.add("%s *%s = %s + %s;" % (param.type, tmp_src_name, prev_tmp_src_name, array_index))
++
++                for member in types[param.type].members:
++                    category = categorize_param(command, types, param.type, member)
++                    if category == ParamCategory.PNEXT:
++                        get_pnext_copy(builder, command, types, param.type, "%s->pNext" % (tmp_src_name), "%s->pNext" % (tmp_dst_name))
++                    elif category == ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE_DATA:
++                        get_param_copy(builder, command, types, "%s->" % (tmp_src_name), "%s->" % (tmp_dst_name), member, dst_initialized=True)
++
++                if struct_info.has_explicit_copy:
++                    builder.add("enqueue_%s(queue, %s, %s);" % (param.type, tmp_dst_name, tmp_src_name))
++                else:
++                    for member in types[param.type].members:
++                        category = categorize_param(command, types, param.type, member)
++                        if category == ParamCategory.STRUCT or category == ParamCategory.STRING or category == ParamCategory.INLINE_STRUCT:
++                            get_param_copy(builder, command, types, "%s->" % (tmp_src_name), "%s->" % (tmp_dst_name), member, dst_initialized=True)
++
++                if struct_array_copy:
++                    builder.level -= 1
++                    builder.add("}")
++
++        if nullable:
++            builder.level -= 1
++            if dst_initialized:
++                builder.add("}")
++            else:
++                builder.add("} else {")
+                 builder.level += 1
+-
+-            if param.type == "void":
+-                size = 1
+-            else:
+-                size = "sizeof(%s)" % param.type
+-
+-            is_ndarray = param.len and "," in param.len
+-            if param.len and param.len != "struct-ptr" and not is_ndarray:
+-                size = "%s * ceil(%s%s)" % (size, src_parent_access, param.len)
+-
+-            if param_category != ParamCategory.INLINE_STRUCT:
+-                builder.add("%s = linear_alloc_child(queue->ctx, %s);" % (dst, size))
+-                builder.add("if (%s == NULL) return NULL;" % (dst))
+-                builder.add("memcpy((void *)%s, %s, %s);" % (dst, src, size))
+-
+-            if param.type == 'VkDescriptorSetLayout':
+-                array_index = builder.get_variable_name("i")
+-                builder.add("for (unsigned %s = 0; %s < %s%s; %s++) {" % (array_index, array_index, src_parent_access, param.len, array_index))
+-                builder.level += 1
+-                builder.add("enqueue_descriptor_layout(queue, %s[%s]);" % (src, array_index))
++                builder.add("%s = NULL;" % (dst))
+                 builder.level -= 1
+                 builder.add("}")
+-
+-            if param.type in types:
+-                struct_info = get_struct_info(command, param, types, src)
+-                for code in struct_info.additional_code:
+-                    builder.add(code);
+-
+-                if struct_info.needs_member_copy:
+-                    tmp_dst_name = builder.get_variable_name("tmp_dst")
+-                    tmp_src_name = builder.get_variable_name("tmp_src")
+-
+-                    builder.add("%s *%s = (void *)%s;" % (param.type, tmp_dst_name, dst))
+-                    builder.add("%s *%s = (void *)%s;" % (param.type, tmp_src_name, src))
+-
+-                    struct_array_copy = param.len and param.len != "struct-ptr" and param.type != "void"
+-                    if struct_array_copy:
+-                        array_index = builder.get_variable_name("i")
+-                        builder.add("for (uint32_t %s = 0; %s < %s%s; %s++) {" % (array_index, array_index, src_parent_access, param.len, array_index))
+-                        builder.level += 1
+-                        prev_tmp_dst_name = tmp_dst_name
+-                        prev_tmp_src_name = tmp_src_name
+-                        tmp_dst_name = builder.get_variable_name("tmp_dst")
+-                        tmp_src_name = builder.get_variable_name("tmp_src")
+-                        builder.add("%s *%s = %s + %s;" % (param.type, tmp_dst_name, prev_tmp_dst_name, array_index))
+-                        builder.add("%s *%s = %s + %s;" % (param.type, tmp_src_name, prev_tmp_src_name, array_index))
+-
+-                    for member in types[param.type].members:
+-                        category = categorize_param(command, types, param.type, member)
+-                        if category == ParamCategory.PNEXT:
+-                            get_pnext_copy(builder, command, types, param.type, "%s->pNext" % (tmp_src_name), "%s->pNext" % (tmp_dst_name))
+-                        elif category == ParamCategory.DESCRIPTOR_UPDATE_TEMPLATE_DATA:
+-                            get_param_copy(builder, command, types, "%s->" % (tmp_src_name), "%s->" % (tmp_dst_name), member, dst_initialized=True)
+-
+-                    if struct_info.has_explicit_copy:
+-                        builder.add("enqueue_%s(queue, %s, %s);" % (param.type, tmp_dst_name, tmp_src_name))
+-                    else:
+-                        for member in types[param.type].members:
+-                            category = categorize_param(command, types, param.type, member)
+-                            if category == ParamCategory.STRUCT or category == ParamCategory.STRING or category == ParamCategory.INLINE_STRUCT:
+-                                get_param_copy(builder, command, types, "%s->" % (tmp_src_name), "%s->" % (tmp_dst_name), member, dst_initialized=True)
+-
+-                    if struct_array_copy:
+-                        builder.level -= 1
+-                        builder.add("}")
+-
+-            if nullable:
+-                builder.level -= 1
+-                if dst_initialized:
+-                    builder.add("}")
+-                else:
+-                    builder.add("} else {")
+-                    builder.level += 1
+-                    builder.add("%s = NULL;" % (dst))
+-                    builder.level -= 1
+-                    builder.add("}")
+-        case ParamCategory.NULL:
+-            assert False
+-        case ParamCategory.PNEXT:
+-            assert False
++    elif param_category in (ParamCategory.NULL, ParamCategory.PNEXT):
++        assert False
+ 
+ def get_params_copy(command, types):
+     builder = CodeBuilder(1)
+
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -161,7 +161,7 @@
+          return result;
+ 
+       if (metal_layer.device == nil)
+-         metal_layer.device = metal_layer.preferredDevice;
++         metal_layer.device = metal_layer.preferredDevice ?: [MTLCreateSystemDefaultDevice() autorelease];
+ 
+       /* So acquire timeout works */
+       metal_layer.allowsNextDrawableTimeout = YES;
+@@ -336,10 +336,19 @@
+       id<MTLBlitCommandEncoder> commandEncoder = [commandBuffer blitCommandEncoder];
+ 
+       NSUInteger image_size = height * row_pitch;
+-      id<MTLBuffer> image_buffer = [[context->device newBufferWithBytesNoCopy:buffer
+-         length:image_size
+-         options:MTLResourceStorageModeShared
+-         deallocator:nil] autorelease];
++      NSUInteger page_aligned_size = (image_size + 4095u) & ~(NSUInteger)4095u;
++      id<MTLBuffer> image_buffer = nil;
++      if (((uintptr_t)buffer & 4095u) == 0) {
++         image_buffer = [[context->device newBufferWithBytesNoCopy:buffer
++            length:page_aligned_size
++            options:MTLResourceStorageModeShared
++            deallocator:nil] autorelease];
++      }
++      if (image_buffer == nil) {
++         image_buffer = [[context->device newBufferWithBytes:buffer
++            length:image_size
++            options:MTLResourceStorageModeShared] autorelease];
++      }
+ 
+       [commandEncoder copyFromBuffer:image_buffer
+          sourceOffset:0

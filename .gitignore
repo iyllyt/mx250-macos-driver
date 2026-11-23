@@ -1,0 +1,21 @@
+# Build outputs & object files
+build/
+dist/
+*.o
+*.a
+*.dylib
+*.pkg
+
+# Upstream source tarballs & extracted trees (fetched during build)
+third_party/
+
+# Private machine-specific OpenCore EFI backups & raw hardware/ACPI dumps
+efi_backup/
+efi_staged/
+hw_dump/
+
+# macOS & Python metadata
+.DS_Store
+._*
+__pycache__/
+*.pyc
