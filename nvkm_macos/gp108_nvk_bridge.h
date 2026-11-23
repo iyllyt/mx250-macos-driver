@@ -68,6 +68,8 @@ uint64_t gp108_nvk_get_vram_used(void);
 int      gp108_nvk_bo_alloc(uint64_t size_B, uint8_t pte_kind,
                             bool in_vram, bool mappable,
                             struct gp108_nvk_bo **out_bo);
+int      gp108_nvk_bo_import_iosurface(uint32_t iosurface_id, uint64_t size_B,
+                                       struct gp108_nvk_bo **out_bo);
 void     gp108_nvk_bo_free(struct gp108_nvk_bo *bo);
 void    *gp108_nvk_bo_map(struct gp108_nvk_bo *bo);
 uint32_t gp108_nvk_bo_handle_id(struct gp108_nvk_bo *bo);

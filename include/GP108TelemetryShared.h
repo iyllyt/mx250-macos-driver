@@ -39,7 +39,16 @@ struct __attribute__((aligned(64))) GP108TelemetryPage {
     uint64_t                  magic;
     uint64_t                  total_submits;
     uint64_t                  total_gpu_busy_ns;
-    uint64_t                  reserved[5];
+    /* Live RM hardware clock/P-state telemetry (exact 40-byte slot formerly reserved[5]) */
+    uint32_t                  rm_active;        /* 1 when gp108-rmd owns GP108 at Full-Blood P0 */
+    uint32_t                  curr_pstate;      /* RM P-state mask: 0x1=P0, 0x100=P8 */
+    uint32_t                  gpc_clk_khz;      /* Live Graphics/Shader clock in kHz */
+    uint32_t                  mem_clk_khz;      /* Live GDDR5 Memory clock in kHz (3504000 = 7008 Mbps) */
+    uint32_t                  sys_clk_khz;      /* Live SYSCLK in kHz */
+    uint32_t                  gpu_temp_c;       /* Live GPU Core Temperature in Celsius */
+    uint64_t                  vram_total_bytes; /* Total GDDR5 VRAM (2048 MiB) */
+    uint32_t                  pci_bdf;          /* Bus<<8 | Dev<<3 | Func */
+    uint32_t                  pmc_boot0;        /* Cached PMC_BOOT_0 (0x138000a1) */
     struct GP108ProcTelemetry procs[GP108_MAX_TELEM_PROCS];
 };
 

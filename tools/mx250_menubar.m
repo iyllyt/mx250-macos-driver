@@ -47,8 +47,9 @@ struct GP108LiveSnapshot {
     struct GP108ProcSnapshot procs[16];
 };
 
-typedef int (*pfn_poll_snapshot_t)(struct GP108LiveSnapshot *, uint32_t);
-typedef int (*pfn_set_power_t)(int);
+typedef int  (*pfn_poll_snapshot_t)(struct GP108LiveSnapshot *, uint32_t);
+typedef int  (*pfn_set_power_t)(int);
+typedef void (*pfn_get_clocks_t)(uint32_t *, uint32_t *, uint32_t *);
 
 @interface MX250MenuController : NSObject <NSMenuDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
@@ -63,6 +64,7 @@ typedef int (*pfn_set_power_t)(int);
 @property(nonatomic, strong) NSTimer *pollTimer;
 @property(nonatomic, assign) pfn_poll_snapshot_t fnPoll;
 @property(nonatomic, assign) pfn_set_power_t fnSetPower;
+@property(nonatomic, assign) pfn_get_clocks_t fnGetClocks;
 @property(nonatomic, assign) struct GP108LiveSnapshot lastSnap;
 @end
 
@@ -77,12 +79,29 @@ typedef int (*pfn_set_power_t)(int);
                         RTLD_NOW | RTLD_LOCAL);
         }
         if (dl) {
-            _fnPoll     = (pfn_poll_snapshot_t)dlsym(dl, "gp108_poll_snapshot");
-            _fnSetPower = (pfn_set_power_t)dlsym(dl, "gp108_set_power_state");
+            _fnPoll      = (pfn_poll_snapshot_t)dlsym(dl, "gp108_poll_snapshot");
+            _fnSetPower  = (pfn_set_power_t)dlsym(dl, "gp108_set_power_state");
+            _fnGetClocks = (pfn_get_clocks_t)dlsym(dl, "gp108_get_live_clocks");
         }
         _procItems = [[NSMutableArray alloc] init];
         [self setupStatusBar];
         [self refreshTelemetry];
+
+        /* On Mode B login / wake, if MX250 was left in raw BIOS D0 with 0 active clients,
+         * automatically cut power to D3cold (0W) so battery life stays maxed out!
+         */
+        uint32_t gpc = 0, mem = 0, rm_act = 0;
+        if (_fnGetClocks) _fnGetClocks(&gpc, &mem, &rm_act);
+        if (_lastSnap.power_state && !rm_act && _lastSnap.proc_count == 0 && _fnSetPower) {
+            _fnSetPower(0);
+            [self refreshTelemetry];
+        }
+
+        [[[NSWorkspace sharedWorkspace] notificationCenter]
+            addObserver:self
+               selector:@selector(onSystemWake:)
+                   name:NSWorkspaceDidWakeNotification
+                 object:nil];
 
         _pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                       target:self
@@ -93,6 +112,20 @@ typedef int (*pfn_set_power_t)(int);
         [[NSRunLoop mainRunLoop] addTimer:_pollTimer forMode:NSRunLoopCommonModes];
     }
     return self;
+}
+
+- (void)onSystemWake:(NSNotification *)note {
+    (void)note;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self refreshTelemetry];
+        uint32_t gpc = 0, mem = 0, rm_act = 0;
+        if (_fnGetClocks) _fnGetClocks(&gpc, &mem, &rm_act);
+        if (_lastSnap.power_state && !rm_act && _lastSnap.proc_count == 0 && _fnSetPower) {
+            _fnSetPower(0);
+            [self refreshTelemetry];
+        }
+    });
 }
 
 - (void)setupStatusBar {
@@ -172,37 +205,44 @@ typedef int (*pfn_set_power_t)(int);
     _lastSnap = s;
 
     if (!s.power_state) {
-        _statusItem.button.title = @"MX250 休眠";
-        _stateItem.title = @"状态：D3cold 断电休眠 (0W 零功耗)";
+        _statusItem.button.title = @"MX250 0W";
+        _stateItem.title = @"状态：D3cold 断电休眠 (0W 零功耗 | 按需自动唤醒)";
         _utilTempItem.title = @"核心占用：0%   |   核心温度：已断电";
         _vramItem.title = [NSString stringWithFormat:@"显存占用：0 MiB / %u MiB", s.vram_total_mib];
-        _irqItem.title = [NSString stringWithFormat:@"历史硬件中断：%llu 次", (unsigned long long)s.irq_count];
-        _powerToggleItem.title = @"⚡ 唤醒 MX250 独显 (切换至 D0)";
+        _irqItem.title = @"模式 B：调用 Vulkan / Metal 时自动 ~1.5s 满血唤醒";
+        _powerToggleItem.title = @"⚡ 手动唤醒 MX250 独显 (满血 P0)";
         _powerToggleItem.enabled = YES;
     } else {
+        uint32_t gpc = 0, mem = 0, rm_act = 0;
+        if (_fnGetClocks) _fnGetClocks(&gpc, &mem, &rm_act);
         NSString *tStr = (s.temp_celsius >= 0)
             ? [NSString stringWithFormat:@"%d°C", s.temp_celsius] : @"--°C";
+        NSString *tag = rm_act ? @"P0" : @"D0";
         if (s.gpu_util_pct > 0 || s.proc_count > 0) {
-            _statusItem.button.title = [NSString stringWithFormat:@"⚡MX250 %u%% %@ %uM",
-                                        s.gpu_util_pct, tStr, s.vram_used_mib];
+            _statusItem.button.title = [NSString stringWithFormat:@"⚡MX250 %@ %u%% %@",
+                                        tag, s.gpu_util_pct, tStr];
         } else {
-            _statusItem.button.title = [NSString stringWithFormat:@"MX250 %u%% %@",
-                                        s.gpu_util_pct, tStr];
+            _statusItem.button.title = [NSString stringWithFormat:@"MX250 %@ %@", tag, tStr];
         }
-        _stateItem.title = [NSString stringWithFormat:@"状态：D0 在线就绪 (0000:%02X:%02X.%X)",
-                            s.bus, s.device, s.function];
+        if (rm_act) {
+            _stateItem.title = [NSString stringWithFormat:@"状态：满血 P0 在线 (%u MHz / %u Mbps | 空闲60s自动0W)",
+                                gpc, mem * 2];
+        } else {
+            _stateItem.title = [NSString stringWithFormat:@"状态：D0 在线 (0000:%02X:%02X.%X)",
+                                s.bus, s.device, s.function];
+        }
         _utilTempItem.title = [NSString stringWithFormat:@"核心占用：%u%%   |   核心温度：%@",
                                s.gpu_util_pct, tStr];
         _vramItem.title = [NSString stringWithFormat:@"显存占用：%u MiB / %u MiB GDDR5",
                            s.vram_used_mib, s.vram_total_mib];
-        _irqItem.title = [NSString stringWithFormat:@"PCIe 链路：Gen%u x%u   |   中断：%llu",
+        _irqItem.title = [NSString stringWithFormat:@"PCIe 链路：Gen%u x%u   |   提交：%llu",
                           s.pcie_gen, s.pcie_width, (unsigned long long)s.irq_count];
 
         if (s.proc_count > 0) {
-            _powerToggleItem.title = @"正在运行任务 (关闭独显进程后可休眠)";
+            _powerToggleItem.title = @"正在运行任务 (退出后空闲 60s 自动 0W 断电)";
             _powerToggleItem.enabled = NO;
         } else {
-            _powerToggleItem.title = @"🌙 断电休眠 MX250 独显 (D3off 0W 省电)";
+            _powerToggleItem.title = @"🌙 立即断电休眠 MX250 (D3cold 0W 省电)";
             _powerToggleItem.enabled = YES;
         }
     }
@@ -240,13 +280,18 @@ typedef int (*pfn_set_power_t)(int);
 }
 
 - (void)launchDemo:(id)sender {
-    if (!_lastSnap.power_state && _fnSetPower) {
-        _fnSetPower(1);
+    (void)sender;
+    NSString *home = NSHomeDirectory();
+    NSString *runner = [home stringByAppendingPathComponent:@"Library/Application Support/NVIDIA-GP108/bin/mx250-metal-run"];
+    NSString *demo   = [home stringByAppendingPathComponent:@"Library/Application Support/NVIDIA-GP108/bin/mx250-metal-demo"];
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:runner]) {
+        runner = @"/Users/maple/projects/temp/mx250-macos/tools/mx250-metal-run";
+        demo   = @"/Users/maple/projects/temp/mx250-macos/build/mx250-metal-demo";
     }
     pid_t pid = 0;
-    const char *argv[] = { "/usr/local/bin/mx250-demo", NULL };
-    posix_spawn(&pid, "/usr/local/bin/mx250-demo", NULL, NULL, (char *const *)argv, environ);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+    const char *argv[] = { [runner UTF8String], [demo UTF8String], "6.0", NULL };
+    posix_spawn(&pid, [runner UTF8String], NULL, NULL, (char *const *)argv, environ);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [self refreshTelemetry]; });
 }
 

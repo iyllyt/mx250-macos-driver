@@ -17,6 +17,9 @@ VkResult nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
                                      enum nvk_debug debug_flags,
                                      struct nvkmd_pdev **pdev_out);
 
+void gp108_vk_set_next_alloc_iosurface_id(uint32_t iosurface_id);
+bool gp108_vk_was_last_iosurface_imported(void);
+
 #ifdef __cplusplus
 }
 #endif

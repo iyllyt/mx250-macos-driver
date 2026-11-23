@@ -276,7 +276,7 @@
  
  nvk_include_directories = [
    fs.relative_to(meson.project_build_root(), meson.current_source_dir()),
-@@ -294,10 +308,24 @@
+@@ -294,10 +308,25 @@
    gnu_symbol_visibility : 'hidden',
  )
  
@@ -284,9 +284,10 @@
 +if host_machine.system() == 'darwin'
 +  nvk_link_args += [
 +    '-Wl,-undefined,dynamic_lookup',
-+    '/Users/maple/projects/temp/mx250-macos/build/libnvkm_gp108.a',
++    '/Users/maple/projects/temp/mx250-macos/build/libgp108_rm_bridge.a',
 +    '-Wl,-framework,IOKit',
 +    '-Wl,-framework,CoreFoundation',
++    '-Wl,-framework,IOSurface',
 +    '-Wl,-framework,Metal',
 +    '-Wl,-framework,QuartzCore',
 +    '-Wl,-framework,Foundation',
@@ -832,9 +833,248 @@
  def get_params_copy(command, types):
      builder = CodeBuilder(1)
 
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -3628,10 +3628,17 @@
+       return result;
+ 
+    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
++#ifdef __APPLE__
++      wsi_configure_buffer_image(chain, pCreateInfo,
++                                 256 /* stride_align: IOSurface & Intel DisplayEngine */,
++                                 65536 /* size_align: Pascal RM 64 KiB VA align */,
++                                 info);
++#else
+       wsi_configure_buffer_image(chain, pCreateInfo,
+                                  1 /* stride_align */,
+                                  1 /* size_align */,
+                                  info);
++#endif
+ 
+       info->select_blit_dst_memory_type = wsi_select_host_memory_type;
+       info->select_image_memory_type = wsi_select_device_memory_type;
+
+--- a/src/vulkan/wsi/wsi_common_metal.c
++++ b/src/vulkan/wsi/wsi_common_metal.c
+@@ -19,6 +19,11 @@
+ #include "vulkan/vulkan_core.h"
+ 
+ #include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++extern void gp108_vk_set_next_alloc_iosurface_id(uint32_t iosurface_id);
++extern bool gp108_vk_was_last_iosurface_imported(void);
+ 
+ struct wsi_metal {
+    struct wsi_interface base;
+@@ -337,6 +342,8 @@
+ struct wsi_metal_image {
+    struct wsi_image base;
+    CAMetalDrawable *drawable;
++   void *iosurface;
++   uint32_t iosurface_id;
+ };
+ 
+ struct wsi_metal_present_info {
+@@ -365,6 +372,8 @@
+ 
+    /* VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR */
+    bool opaque_composition;
++   bool zero_copy_iosurface;
++   uint64_t next_fifo_present_ns;
+ 
+    struct wsi_metal_image images[0];
+ };
+@@ -594,6 +603,13 @@
+ {
+    struct wsi_metal_swapchain *chain =
+       (struct wsi_metal_swapchain *)wsi_chain;
++
++   if (chain->zero_copy_iosurface) {
++      uint32_t i = (chain->current_image_index++) % chain->base.image_count;
++      *image_index = i;
++      return VK_SUCCESS;
++   }
++
+    struct timespec start_time, end_time;
+    struct timespec rel_timeout;
+ 
+@@ -698,6 +714,35 @@
+ 
+    struct wsi_metal_image *image = &chain->images[image_index];
+ 
++   if (chain->zero_copy_iosurface) {
++      if (chain->base.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
++         const uint64_t frame_ns = 16666667ULL; /* 60 Hz FIFO cadence */
++         uint64_t now_ns = os_time_get_nano();
++         if (chain->next_fifo_present_ns > now_ns) {
++            uint64_t sleep_ns = chain->next_fifo_present_ns - now_ns;
++            struct timespec ts = {
++               .tv_sec = (time_t)(sleep_ns / 1000000000ULL),
++               .tv_nsec = (long)(sleep_ns % 1000000000ULL),
++            };
++            nanosleep(&ts, NULL);
++            now_ns = os_time_get_nano();
++         }
++         chain->next_fifo_present_ns = now_ns + frame_ns;
++      }
++
++      wsi_metal_layer_present_iosurface(chain->surface->pLayer,
++                                        image->iosurface);
++      if (present_id && wsi_chain->present_wait_enabled) {
++         wsi_metal_retain_present_info(chain->present_info);
++         wsi_metal_present_complete(chain->present_info, present_id);
++      }
++
++      uint32_t width = 0u, height = 0u;
++      wsi_metal_layer_size(chain->surface->pLayer, &width, &height);
++      bool is_optimal = (width == chain->extent.width && height == chain->extent.height);
++      return is_optimal ? VK_SUCCESS : VK_SUBOPTIMAL_KHR;
++   }
++
+    if (present_id && wsi_chain->present_wait_enabled) {
+       wsi_metal_retain_present_info(chain->present_info);
+       wsi_metal_layer_add_presented_handler(
+@@ -784,6 +829,11 @@
+    /* Software backends can just call common and return */
+    if (wsi->sw) {
+       wsi_destroy_image(chain, image);
++      if (metal_image->iosurface) {
++         wsi_metal_release_iosurface(metal_image->iosurface);
++         metal_image->iosurface = NULL;
++         metal_image->iosurface_id = 0;
++      }
+       return;
+    }
+ 
+@@ -820,7 +870,35 @@
+    const struct wsi_device *wsi = chain->wsi;
+    struct wsi_image *image = &metal_image->base;
+ 
++   metal_image->iosurface = NULL;
++   metal_image->iosurface_id = 0;
++
++   void *iosurf = NULL;
++   uint32_t iosurf_id = 0;
++   if (wsi->sw && info->linear_stride > 0 && info->linear_size > 0 &&
++       getenv("GP108_DISABLE_ZEROCOPY") == NULL) {
++      iosurf = wsi_metal_create_iosurface(metal_chain->extent.width,
++                                          metal_chain->extent.height,
++                                          info->linear_stride,
++                                          info->linear_size,
++                                          metal_chain->vk_format,
++                                          &iosurf_id);
++      if (iosurf && iosurf_id != 0)
++         gp108_vk_set_next_alloc_iosurface_id(iosurf_id);
++   }
++
+    VkResult result = wsi_create_image(chain, info, image);
++
++   if (iosurf) {
++      bool imported = gp108_vk_was_last_iosurface_imported();
++      gp108_vk_set_next_alloc_iosurface_id(0);
++      if (result == VK_SUCCESS && imported) {
++         metal_image->iosurface = iosurf;
++         metal_image->iosurface_id = iosurf_id;
++      } else {
++         wsi_metal_release_iosurface(iosurf);
++      }
++   }
+ 
+    /* Software backends can just call common and return */
+    if (wsi->sw || result != VK_SUCCESS)
+@@ -844,6 +922,9 @@
+ {
+    struct wsi_metal_swapchain *chain =
+       (struct wsi_metal_swapchain *)wsi_chain;
++
++   if (chain->zero_copy_iosurface && chain->surface && chain->surface->pLayer)
++      wsi_metal_layer_cleanup_iosurface(chain->surface->pLayer);
+ 
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       struct wsi_metal_image *image = &chain->images[i];
+@@ -856,7 +937,7 @@
+          wsi_metal_destroy_image(chain, image);
+    }
+ 
+-   if (chain->base.wsi->sw)
++   if (chain->blit_context)
+       wsi_destroy_metal_layer_blit_context(chain->blit_context);
+ 
+    wsi_metal_release_present_info(chain->present_info);
+@@ -964,6 +1045,7 @@
+    }
+ 
+    uint32_t created_image_count = 0;
++   bool all_iosurface = is_sw_driver && (chain->base.image_count > 0);
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       result = wsi_metal_create_image(chain, &chain->base.image_info,
+                                       &chain->images[i]);
+@@ -971,11 +1053,22 @@
+          goto fail_init_images;
+ 
+       chain->images[i].drawable = NULL;
++      if (chain->images[i].iosurface == NULL)
++         all_iosurface = false;
+       created_image_count++;
+    }
+ 
+-   if (is_sw_driver)
++   chain->zero_copy_iosurface = all_iosurface;
++   if (chain->zero_copy_iosurface) {
++      fprintf(stderr,
++              "[GP108-WSI] Zero-Copy IOSurface Swapchain active: %ux%u "
++              "(pitch=%u, %u IOSurfaces, 0 CPU memcpy, 0 Intel Metal blit)\n",
++              chain->extent.width, chain->extent.height,
++              chain->base.image_info.linear_stride,
++              chain->base.image_count);
++   } else if (is_sw_driver) {
+       chain->blit_context = wsi_create_metal_layer_blit_context();
++   }
+ 
+    *swapchain_out = &chain->base;
+ 
+
+--- a/src/vulkan/wsi/wsi_common_metal_layer.h
++++ b/src/vulkan/wsi/wsi_common_metal_layer.h
+@@ -59,6 +59,21 @@
+ void
+ wsi_metal_layer_present(CAMetalDrawable **drawable_ptr);
+ 
++void *
++wsi_metal_create_iosurface(uint32_t width, uint32_t height,
++                           uint32_t row_pitch, uint64_t alloc_size,
++                           VkFormat format, uint32_t *out_iosurface_id);
++
++void
++wsi_metal_release_iosurface(void *iosurface_ptr);
++
++void
++wsi_metal_layer_present_iosurface(const CAMetalLayer *metal_layer,
++                                  void *iosurface_ptr);
++
++void
++wsi_metal_layer_cleanup_iosurface(const CAMetalLayer *metal_layer);
++
+ void
+ wsi_metal_layer_make_queue_resident(const CAMetalLayer *metal_layer,
+    void *mtl4_command_queue);
+
 --- a/src/vulkan/wsi/wsi_common_metal_layer.m
 +++ b/src/vulkan/wsi/wsi_common_metal_layer.m
-@@ -161,7 +161,7 @@
+@@ -9,7 +9,10 @@
+ #include "vk_format.h"
+ 
+ #import <QuartzCore/CAMetalLayer.h>
++#import <QuartzCore/CATransaction.h>
+ #import <Metal/Metal.h>
++#import <IOSurface/IOSurface.h>
++#import <objc/runtime.h>
+ 
+ void
+ wsi_metal_layer_size(const CAMetalLayer *metal_layer,
+@@ -161,7 +164,7 @@
           return result;
  
        if (metal_layer.device == nil)
@@ -843,7 +1083,7 @@
  
        /* So acquire timeout works */
        metal_layer.allowsNextDrawableTimeout = YES;
-@@ -336,10 +336,19 @@
+@@ -336,10 +339,19 @@
        id<MTLBlitCommandEncoder> commandEncoder = [commandBuffer blitCommandEncoder];
  
        NSUInteger image_size = height * row_pitch;
@@ -867,3 +1107,134 @@
  
        [commandEncoder copyFromBuffer:image_buffer
           sourceOffset:0
+@@ -369,6 +381,130 @@
+    }
+ }
+ 
++static const char kGP108ZeroCopySublayerKey = 0;
++
++void *
++wsi_metal_create_iosurface(uint32_t width, uint32_t height,
++                           uint32_t row_pitch, uint64_t alloc_size,
++                           VkFormat format, uint32_t *out_iosurface_id)
++{
++   @autoreleasepool {
++      uint32_t pixel_fmt = 'BGRA';
++      uint32_t bpe = 4;
++      switch (format) {
++      case VK_FORMAT_B8G8R8A8_UNORM:
++      case VK_FORMAT_B8G8R8A8_SRGB:
++         pixel_fmt = 'BGRA';
++         bpe = 4;
++         break;
++      case VK_FORMAT_R16G16B16A16_SFLOAT:
++         pixel_fmt = 'RGhA';
++         bpe = 8;
++         break;
++      case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++         pixel_fmt = 'l10r';
++         bpe = 4;
++         break;
++      default:
++         return NULL;
++      }
++
++      NSDictionary *props = @{
++         (id)kIOSurfaceWidth: @(width),
++         (id)kIOSurfaceHeight: @(height),
++         (id)kIOSurfaceBytesPerElement: @(bpe),
++         (id)kIOSurfaceBytesPerRow: @(row_pitch),
++         (id)kIOSurfaceAllocSize: @(alloc_size),
++         (id)kIOSurfacePixelFormat: @(pixel_fmt),
++         (id)kIOSurfaceIsGlobal: @YES,
++      };
++      IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
++      if (!surf)
++         return NULL;
++
++      IOSurfaceSetValue(surf, CFSTR("IOSurfaceColorSpace"), kCGColorSpaceSRGB);
++      if (out_iosurface_id)
++         *out_iosurface_id = (uint32_t)IOSurfaceGetID(surf);
++      return (void *)surf;
++   }
++}
++
++void
++wsi_metal_release_iosurface(void *iosurface_ptr)
++{
++   if (iosurface_ptr)
++      CFRelease((IOSurfaceRef)iosurface_ptr);
++}
++
++void
++wsi_metal_layer_present_iosurface(const CAMetalLayer *metal_layer,
++                                  void *iosurface_ptr)
++{
++   if (!metal_layer || !iosurface_ptr)
++      return;
++
++   @autoreleasepool {
++      IOSurfaceRef surf = (IOSurfaceRef)iosurface_ptr;
++      /* Bump IOSurface generation seed so WindowServer sees MX250 PCIe DMA writes */
++      uint32_t seed = 0;
++      IOSurfaceLock(surf, 0, &seed);
++      IOSurfaceUnlock(surf, 0, &seed);
++
++      CALayer *root = (CALayer *)metal_layer;
++      [CATransaction begin];
++      [CATransaction setDisableActions:YES];
++
++      CALayer *ioLayer = objc_getAssociatedObject(root, &kGP108ZeroCopySublayerKey);
++      if (!ioLayer) {
++         ioLayer = [CALayer layer];
++         ioLayer.anchorPoint = CGPointMake(0.0, 0.0);
++         ioLayer.position = CGPointMake(0.0, 0.0);
++         ioLayer.bounds = root.bounds;
++         ioLayer.contentsScale = root.contentsScale;
++         ioLayer.contentsGravity = kCAGravityResize;
++         ioLayer.opaque = root.opaque;
++         ioLayer.actions = @{
++            @"contents": [NSNull null],
++            @"bounds": [NSNull null],
++            @"position": [NSNull null],
++            @"sublayers": [NSNull null],
++            @"onOrderIn": [NSNull null],
++         };
++         [root addSublayer:ioLayer];
++         objc_setAssociatedObject(root, &kGP108ZeroCopySublayerKey, ioLayer,
++                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++      } else if (!CGRectEqualToRect(ioLayer.bounds, root.bounds)) {
++         ioLayer.bounds = root.bounds;
++         ioLayer.contentsScale = root.contentsScale;
++      }
++
++      ioLayer.contents = (id)surf;
++      [CATransaction commit];
++      [CATransaction flush];
++   }
++}
++
++void
++wsi_metal_layer_cleanup_iosurface(const CAMetalLayer *metal_layer)
++{
++   if (!metal_layer)
++      return;
++   @autoreleasepool {
++      CALayer *root = (CALayer *)metal_layer;
++      CALayer *ioLayer = objc_getAssociatedObject(root, &kGP108ZeroCopySublayerKey);
++      if (ioLayer) {
++         [CATransaction begin];
++         [CATransaction setDisableActions:YES];
++         ioLayer.contents = nil;
++         [ioLayer removeFromSuperlayer];
++         [CATransaction commit];
++         objc_setAssociatedObject(root, &kGP108ZeroCopySublayerKey, nil,
++                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++      }
++   }
++}
++
+ void
+ wsi_metal_layer_make_queue_resident(const CAMetalLayer *metal_layer,
+    void *mtl4_command_queue)

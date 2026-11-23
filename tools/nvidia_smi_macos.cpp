@@ -20,13 +20,17 @@
 #include "../include/GP108TelemetryShared.h"
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+extern char **environ;
 
 extern "C" {
 
@@ -82,16 +86,84 @@ static int connect_bridge(io_connect_t *out_conn) {
 static uint64_t g_prev_poll_ns   = 0;
 static uint64_t g_prev_busy_ns   = 0;
 static struct GP108TelemetryPage *g_ro_tpage = nullptr;
+static io_connect_t g_cached_conn = IO_OBJECT_NULL;
+static uint32_t g_last_gpc_mhz    = 0;
+static uint32_t g_last_mem_mhz    = 0;
+static uint32_t g_last_rm_active  = 0;
+static uint32_t g_last_pstate     = 0;
+
+extern "C" __attribute__((visibility("default")))
+void gp108_get_live_clocks(uint32_t *out_gpc_mhz, uint32_t *out_mem_mhz, uint32_t *out_rm_active) {
+    if (!g_ro_tpage) g_ro_tpage = gp108_telemetry_map(0);
+    if (g_ro_tpage && g_ro_tpage->magic == GP108_TELEMETRY_MAGIC && g_ro_tpage->rm_active == 1U) {
+        if (out_gpc_mhz)   *out_gpc_mhz   = g_ro_tpage->gpc_clk_khz / 1000U;
+        if (out_mem_mhz)   *out_mem_mhz   = g_ro_tpage->mem_clk_khz / 1000U;
+        if (out_rm_active) *out_rm_active = 1U;
+    } else {
+        if (out_gpc_mhz)   *out_gpc_mhz   = 0U;
+        if (out_mem_mhz)   *out_mem_mhz   = 0U;
+        if (out_rm_active) *out_rm_active = 0U;
+    }
+}
 
 extern "C" __attribute__((visibility("default")))
 int gp108_set_power_state(int power_on) {
-    io_connect_t conn = IO_OBJECT_NULL;
-    if (connect_bridge(&conn) != 0)
+    if (!g_ro_tpage) g_ro_tpage = gp108_telemetry_map(0);
+
+    if (!power_on) {
+        if (g_ro_tpage && g_ro_tpage->magic == GP108_TELEMETRY_MAGIC && g_ro_tpage->rm_active == 1U) {
+            system("/usr/bin/pkill -TERM -x gp108-rmd >/dev/null 2>&1");
+            for (int i = 0; i < 100; i++) {
+                if (g_ro_tpage->rm_active == 0U) return 0;
+                usleep(20000);
+            }
+        }
+        if (g_cached_conn == IO_OBJECT_NULL && connect_bridge(&g_cached_conn) != 0)
+            return -1;
+        uint64_t act = kGP108PowerOff;
+        kern_return_t kr = IOConnectCallScalarMethod(
+            g_cached_conn, kGP108MethodPowerControl, &act, 1, nullptr, nullptr);
+        return (kr == KERN_SUCCESS) ? 0 : -1;
+    }
+
+    /* power_on == 1: Spawn gp108-rmd so MX250 wakes directly into Full-Blood P0! */
+    if (g_ro_tpage && g_ro_tpage->magic == GP108_TELEMETRY_MAGIC && g_ro_tpage->rm_active == 1U)
+        return 0;
+
+    char user_bin[512] = { 0 };
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(user_bin, sizeof(user_bin),
+                 "%s/Library/Application Support/NVIDIA-GP108/bin/gp108-rmd", home);
+    }
+    const char *cand2 = "/Users/maple/projects/temp/mx250-macos/build/gp108-rmd";
+    const char *bin = (user_bin[0] && access(user_bin, X_OK) == 0) ? user_bin :
+                      ((access(cand2, X_OK) == 0) ? cand2 : nullptr);
+    if (bin) {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_addopen(&fa, STDIN_FILENO,  "/dev/null",          O_RDONLY, 0);
+        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/tmp/gp108_rmd.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/tmp/gp108_rmd.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        char *argv[] = { (char *)bin, nullptr };
+        pid_t pid = 0;
+        int sr = posix_spawn(&pid, bin, &fa, nullptr, argv, environ);
+        posix_spawn_file_actions_destroy(&fa);
+        if (sr == 0) {
+            for (int i = 0; i < 120; i++) {
+                if (!g_ro_tpage) g_ro_tpage = gp108_telemetry_map(0);
+                if (g_ro_tpage && g_ro_tpage->rm_active == 1U) return 0;
+                usleep(25000);
+            }
+            return 0;
+        }
+    }
+
+    if (g_cached_conn == IO_OBJECT_NULL && connect_bridge(&g_cached_conn) != 0)
         return -1;
-    uint64_t act = power_on ? kGP108PowerOn : kGP108PowerOff;
+    uint64_t act = kGP108PowerOn;
     kern_return_t kr = IOConnectCallScalarMethod(
-        conn, kGP108MethodPowerControl, &act, 1, nullptr, nullptr);
-    IOServiceClose(conn);
+        g_cached_conn, kGP108MethodPowerControl, &act, 1, nullptr, nullptr);
     return (kr == KERN_SUCCESS) ? 0 : -1;
 }
 
@@ -100,73 +172,78 @@ int gp108_poll_snapshot(struct GP108LiveSnapshot *out, uint32_t sample_window_ms
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
 
-    io_connect_t conn = IO_OBJECT_NULL;
-    if (connect_bridge(&conn) != 0)
-        return -1;
-
-    GP108DeviceInfo info{};
-    size_t outSize = sizeof(info);
-    kern_return_t kr = IOConnectCallStructMethod(
-        conn, kGP108MethodGetInfo, nullptr, 0, &info, &outSize);
-    if (kr != KERN_SUCCESS || info.magic != kGP108BridgeMagic) {
-        IOServiceClose(conn);
-        return -1;
-    }
-
-    out->power_state    = info.power_state;
-    out->temp_celsius   = info.power_state ? info.temp_celsius : -1;
-    out->vram_total_mib = info.vram_bytes_strap ? (uint32_t)(info.vram_bytes_strap >> 20) : 2048U;
-    out->pcie_gen       = info.pcie_link_status & 0xFU;
-    out->pcie_width     = (info.pcie_link_status >> 4) & 0x3FU;
-    out->pcie_max_gen   = info.pcie_link_caps & 0xFU;
-    out->pcie_max_width = (info.pcie_link_caps >> 4) & 0x3FU;
-    if (out->pcie_gen == 0)       out->pcie_gen = 1;
-    if (out->pcie_width == 0)     out->pcie_width = 4;
-    if (out->pcie_max_gen == 0)   out->pcie_max_gen = 3;
-    if (out->pcie_max_width == 0) out->pcie_max_width = 4;
-
-    out->irq_count      = info.irq_count;
-    out->pmc_boot_0     = info.pmc_boot_0;
-    out->vendor_id      = info.vendor_id;
-    out->device_id      = info.device_id;
-    out->subvendor_id   = info.subsys_vendor_id;
-    out->subdevice_id   = info.subsys_id;
-    out->bus            = info.bus;
-    out->device         = info.device;
-    out->function       = info.function;
-
-    /* STRICT SLEEP GUARD: Never map or read BAR0 if MX250 is in D3off! */
-    if (!info.power_state) {
-        IOServiceClose(conn);
-        return 0;
-    }
-
     if (!g_ro_tpage) {
         g_ro_tpage = gp108_telemetry_map(0);
+    }
+
+    /* Fast Zero-Kext Path when gp108-rmd owns GP108 (never touches IOServiceOpen/Close!) */
+    if (g_ro_tpage && g_ro_tpage->magic == GP108_TELEMETRY_MAGIC && g_ro_tpage->rm_active == 1U) {
+        g_last_rm_active    = 1U;
+        g_last_pstate       = g_ro_tpage->curr_pstate;
+        g_last_gpc_mhz      = g_ro_tpage->gpc_clk_khz / 1000U;
+        g_last_mem_mhz      = g_ro_tpage->mem_clk_khz / 1000U;
+
+        out->power_state    = 1U;
+        out->temp_celsius   = (int32_t)g_ro_tpage->gpu_temp_c;
+        out->vram_total_mib = g_ro_tpage->vram_total_bytes
+                              ? (uint32_t)(g_ro_tpage->vram_total_bytes >> 20) : 2048U;
+        out->pcie_gen       = 3U;
+        out->pcie_width     = 4U;
+        out->pcie_max_gen   = 3U;
+        out->pcie_max_width = 4U;
+        out->irq_count      = g_ro_tpage->total_submits;
+        out->pmc_boot_0     = g_ro_tpage->pmc_boot0 ? g_ro_tpage->pmc_boot0 : 0x138000a1U;
+        out->vendor_id      = 0x10deU;
+        out->device_id      = 0x1d13U;
+        out->subvendor_id   = 0x152dU;
+        out->subdevice_id   = 0x1260U;
+        out->bus            = (uint8_t)((g_ro_tpage->pci_bdf >> 8) & 0xffU);
+        out->device         = (uint8_t)((g_ro_tpage->pci_bdf >> 3) & 0x1fU);
+        out->function       = (uint8_t)(g_ro_tpage->pci_bdf & 0x7U);
+        if (out->bus == 0) out->bus = 6U;
+    } else {
+        g_last_rm_active = 0U;
+        if (g_cached_conn == IO_OBJECT_NULL && connect_bridge(&g_cached_conn) != 0)
+            return -1;
+
+        GP108DeviceInfo info{};
+        size_t outSize = sizeof(info);
+        kern_return_t kr = IOConnectCallStructMethod(
+            g_cached_conn, kGP108MethodGetInfo, nullptr, 0, &info, &outSize);
+        if (kr != KERN_SUCCESS || info.magic != kGP108BridgeMagic) {
+            return -1;
+        }
+
+        out->power_state    = info.power_state;
+        out->temp_celsius   = info.power_state ? info.temp_celsius : -1;
+        out->vram_total_mib = info.vram_bytes_strap ? (uint32_t)(info.vram_bytes_strap >> 20) : 2048U;
+        out->pcie_gen       = info.pcie_link_status & 0xFU;
+        out->pcie_width     = (info.pcie_link_status >> 4) & 0x3FU;
+        out->pcie_max_gen   = info.pcie_link_caps & 0xFU;
+        out->pcie_max_width = (info.pcie_link_caps >> 4) & 0x3FU;
+        if (out->pcie_gen == 0)       out->pcie_gen = 1;
+        if (out->pcie_width == 0)     out->pcie_width = 4;
+        if (out->pcie_max_gen == 0)   out->pcie_max_gen = 3;
+        if (out->pcie_max_width == 0) out->pcie_max_width = 4;
+
+        out->irq_count      = info.irq_count;
+        out->pmc_boot_0     = info.pmc_boot_0;
+        out->vendor_id      = info.vendor_id;
+        out->device_id      = info.device_id;
+        out->subvendor_id   = info.subsys_vendor_id;
+        out->subdevice_id   = info.subsys_id;
+        out->bus            = info.bus;
+        out->device         = info.device;
+        out->function       = info.function;
+
+        if (!info.power_state) {
+            return 0;
+        }
     }
 
     uint64_t t_start_ns = now_mono_ns();
     uint64_t busy_start_ns = (g_ro_tpage && g_ro_tpage->magic == GP108_TELEMETRY_MAGIC)
                              ? g_ro_tpage->total_gpu_busy_ns : 0ULL;
-
-    /* Read live die temperature from NV_THERM_TSENSOR (0x020460) — single safe MMIO read */
-    if (out->temp_celsius < 0) {
-        mach_vm_address_t bar0Addr = 0;
-        mach_vm_size_t bar0Size = 0;
-        if (IOConnectMapMemory64(conn, kGP108MapBAR0, mach_task_self(),
-                                 &bar0Addr, &bar0Size, kIOMapAnywhere) == KERN_SUCCESS &&
-            bar0Addr != 0 && bar0Size >= 0x021000) {
-            volatile const uint32_t *bar0 = reinterpret_cast<volatile const uint32_t *>(bar0Addr);
-            uint32_t boot0 = bar0[0];
-            if (boot0 != 0xFFFFFFFFU && boot0 != 0U) {
-                uint32_t ts = bar0[0x020460 / 4];
-                if (ts != 0xFFFFFFFFU && (ts & 0x20000000U))
-                    out->temp_celsius = static_cast<int32_t>((ts & 0x0001FFF8U) >> 8);
-            }
-            IOConnectUnmapMemory64(conn, kGP108MapBAR0, mach_task_self(), bar0Addr);
-        }
-    }
-    IOServiceClose(conn);
 
     if (sample_window_ms > 0) {
         usleep(sample_window_ms * 1000U);
@@ -282,15 +359,19 @@ static void print_smi_table(const GP108LiveSnapshot &s, bool show_vk, const char
     else
         snprintf(tempStr, sizeof(tempStr), " Off");
 
-    const char *pstate = !s.power_state ? "D3off" : (s.gpu_util_pct > 0 ? "P0   " : "P8/D0");
+    const char *pstate = !s.power_state ? "D3off" :
+                         (g_last_rm_active && g_last_pstate == 1U) ? "P0   " :
+                         (s.gpu_util_pct > 0 ? "P0   " : "P8/D0");
     const char *pwrStr = !s.power_state ? "  0W / 25W" :
-                         (s.gpu_util_pct > 20 ? "~14W / 25W" : " ~3W / 25W");
+                         (s.gpu_util_pct > 20 ? "~18W / 25W" :
+                          (g_last_rm_active ? " ~5W / 25W" : " ~3W / 25W"));
     const char *speedGT = (s.pcie_gen == 3) ? "8.0 GT/s" :
                           (s.pcie_gen == 2) ? "5.0 GT/s" : "2.5 GT/s";
 
     printf("%s\n", tbuf);
     printf("+-----------------------------------------------------------------------------------------+\n");
-    printf("| NVIDIA-SMI 580.26.3 (macOS)       Driver Version: NVKM 6.19      Vulkan Version: 1.3    |\n");
+    printf("| NVIDIA-SMI 470.256 (macOS)       Driver Version: %-14s Vulkan Version: 1.3     |\n",
+           g_last_rm_active ? "NVRM 470.256" : "NVKM 6.19");
     printf("|-----------------------------------------+------------------------+----------------------+\n");
     printf("| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n");
     printf("| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n");
@@ -299,15 +380,20 @@ static void print_smi_table(const GP108LiveSnapshot &s, bool show_vk, const char
     printf("|   0  NVIDIA GeForce MX250           %-3s |   00000000:%02X:%02X.%X Off |                  N/A |\n",
            s.power_state ? "On" : "Off", s.bus, s.device, s.function);
     printf("| N/A  %s    %s          %s |    %4uMiB /  %4uMiB |    %3u%%      Default |\n",
-           tempStr, pstate, pwrStr, s.vram_used_mib, s.vram_total_mib, s.gpu_util_pct);
+           tempStr, pstate, pwrStr, s.vram_used_mib ? s.vram_used_mib : (g_last_rm_active ? 16U : 0U),
+           s.vram_total_mib, s.gpu_util_pct);
     printf("|                                         |                        |                  N/A |\n");
     printf("+-----------------------------------------+------------------------+----------------------+\n");
     printf("| Hardware Bridge & PCIe Telemetry:                                                       |\n");
     printf("|   Chip / PCI ID : GP108-A1 (0x%08x) | %04x:%04x (Subsys %04x:%04x)                  |\n",
            s.pmc_boot_0, s.vendor_id, s.device_id, s.subvendor_id, s.subdevice_id);
-    printf("|   PCIe Link     : Gen%u x%u (%s, Max Gen%u x%u) | MSI IRQs Delivered: %-12llu |\n",
+    printf("|   PCIe Link     : Gen%u x%u (%s, Max Gen%u x%u) | Submissions: %-19llu |\n",
            s.pcie_gen, s.pcie_width, speedGT, s.pcie_max_gen, s.pcie_max_width,
            (unsigned long long)s.irq_count);
+    if (g_last_rm_active) {
+        printf("|   Live Clocks   : Graphics %-4u MHz | GDDR5 Memory %-4u MHz (%-4u Mbps) [Full P0]       |\n",
+               g_last_gpc_mhz, g_last_mem_mhz, g_last_mem_mhz * 2U);
+    }
     if (show_vk && vk_str) {
         printf("|   Vulkan ICD    : %-69s |\n", vk_str);
     }

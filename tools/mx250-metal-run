@@ -1,0 +1,25 @@
+#!/bin/zsh
+# SPDX-License-Identifier: MIT
+# Launch any macOS Metal binary on Full-Blood P0 NVIDIA GeForce MX250 (Mode B On-Demand, SIP & AMFI Enabled)
+
+set -e
+if [[ $# -eq 0 ]]; then
+    echo "Usage: mx250-metal-run <metal-app-binary> [args...]" >&2
+    exit 1
+fi
+
+USER_LIB="${HOME}/Library/Application Support/NVIDIA-GP108/lib"
+DEV_BUILD="/Users/maple/projects/temp/mx250-macos/build"
+
+if [[ -f "${USER_LIB}/libmx250_metal.dylib" ]]; then
+    LIB_DIR="${USER_LIB}"
+else
+    LIB_DIR="${DEV_BUILD}"
+fi
+
+export MX250_VK_ICD_DYLIB="${LIB_DIR}/libvulkan_nvk.dylib"
+export MX250_TRANSLATOR_DYLIB="${LIB_DIR}/libnvmtl_translate.dylib"
+export VK_DRIVER_FILES="${HOME}/.local/share/vulkan/icd.d/00_nvidia_mx250_icd.json"
+export DYLD_INSERT_LIBRARIES="${LIB_DIR}/libmx250_metal.dylib${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}"
+
+exec "$@"

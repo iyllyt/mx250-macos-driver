@@ -18,10 +18,10 @@
 #include <string.h>
 #include <time.h>
 
-#define NVKMD_MACOS_HEAP_START        0x00000010000ULL /* 64 KiB (GP100 VMM start) */
-#define NVKMD_MACOS_HEAP_END          (1ULL << 38)     /* 256 GiB */
+#define NVKMD_MACOS_HEAP_START        0x0010000000ULL /* 256 MiB (PDE-aligned RM VA start) */
+#define NVKMD_MACOS_HEAP_END          0x1000000000ULL /* 64 GiB */
 #define NVKMD_MACOS_REPLAY_HEAP_START NVKMD_MACOS_HEAP_END
-#define NVKMD_MACOS_REPLAY_HEAP_END   (1ULL << 39)     /* 512 GiB */
+#define NVKMD_MACOS_REPLAY_HEAP_END   0x1800000000ULL /* 96 GiB */
 
 #define NVKMD_MACOS_MAX_SYNCS         256U
 #define NVKMD_MACOS_RING_SLOTS        128U
@@ -447,6 +447,8 @@ nvkmd_macos_alloc_va(struct nvkmd_dev *_dev,
       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    align_B = MAX2(align_B, _dev->pdev->bind_align_B);
+   if (pte_kind != 0)
+      align_B = MAX2(align_B, 65536ULL);
    size_B  = align64(size_B, align_B);
 
    VkResult result = alloc_heap_addr(dev, log_obj, flags, size_B, align_B,
@@ -562,6 +564,22 @@ const struct nvkmd_mem_ops nvkmd_macos_mem_ops = {
    .log_handle     = nvkmd_macos_mem_log_handle,
 };
 
+static __thread uint32_t g_tls_next_iosurface_id = 0;
+static __thread bool     g_tls_last_iosurface_ok = false;
+
+PUBLIC void
+gp108_vk_set_next_alloc_iosurface_id(uint32_t iosurface_id)
+{
+   g_tls_next_iosurface_id = iosurface_id;
+   g_tls_last_iosurface_ok = false;
+}
+
+PUBLIC bool
+gp108_vk_was_last_iosurface_imported(void)
+{
+   return g_tls_last_iosurface_ok;
+}
+
 static VkResult
 nvkmd_macos_alloc_tiled_mem(struct nvkmd_dev *_dev,
                             struct vk_object_base *log_obj,
@@ -574,6 +592,8 @@ nvkmd_macos_alloc_tiled_mem(struct nvkmd_dev *_dev,
    struct nvkmd_macos_dev *dev = nvkmd_macos_dev(_dev);
 
    align_B = MAX2(align_B, dev->base.pdev->bind_align_B);
+   if (pte_kind != 0)
+      align_B = MAX2(align_B, 65536ULL);
    size_B  = align64(size_B, align_B);
 
    bool in_vram = (flags & (NVKMD_MEM_VRAM | NVKMD_MEM_LOCAL)) != 0;
@@ -583,7 +603,20 @@ nvkmd_macos_alloc_tiled_mem(struct nvkmd_dev *_dev,
    flags |= NVKMD_MEM_COHERENT;
 
    struct gp108_nvk_bo *bo = NULL;
-   int err = gp108_nvk_bo_alloc(size_B, pte_kind, in_vram, mappable, &bo);
+   int err = -1;
+   if (!in_vram && g_tls_next_iosurface_id != 0) {
+      uint32_t surf_id = g_tls_next_iosurface_id;
+      g_tls_next_iosurface_id = 0;
+      err = gp108_nvk_bo_import_iosurface(surf_id, size_B, &bo);
+      if (err == 0 && bo != NULL) {
+         g_tls_last_iosurface_ok = true;
+      } else {
+         g_tls_last_iosurface_ok = false;
+         err = gp108_nvk_bo_alloc(size_B, pte_kind, in_vram, mappable, &bo);
+      }
+   } else {
+      err = gp108_nvk_bo_alloc(size_B, pte_kind, in_vram, mappable, &bo);
+   }
    if (err != 0 || !bo)
       return vk_error(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
@@ -1130,7 +1163,7 @@ nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
       .has_compression   = false,
    };
 
-   pdev->base.bind_align_B = 4096U;
+   pdev->base.bind_align_B = 65536U; /* 64 KiB Pascal RM eheap / Big-Page alignment */
 
    pdev->sync_binary_type = vk_sync_binary_get_type(&nvkmd_macos_timeline_sync_type);
    pdev->sync_types[0]    = &nvkmd_macos_timeline_sync_type;
